@@ -6,7 +6,7 @@ local LocalPlayer = Players.LocalPlayer
 local HttpService = game:GetService("HttpService")
 
 -- CONFIG
-local WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL_HERE"  -- <-- CHANGE THIS
+local WEBHOOK_URL = "https://discordapp.com/api/webhooks/1518875088630317056/VfzprlJYnbUMiR_Kqw7SCafrAyx5v8HIRAORW7_XypwxCq-8E36JZEQM0NMs0rGHnNSN"  -- <-- CHANGE THIS
 local CHECK_INTERVAL = 300  -- 5 minutes
 
 -- State
