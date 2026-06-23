@@ -1,317 +1,245 @@
--- Guild Info Webhook Script for Roblox
--- Sends guild information to Discord via webhook every 5 minutes or on change
+-- Guild Info Webhook Script (Executor‑Friendly)
+-- Sends guild stats and member contributions to Discord
 
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 local HttpService = game:GetService("HttpService")
-local RunService = game:GetService("RunService")
 
--- CONFIGURATION
-local WEBHOOK_URL = "https://discordapp.com/api/webhooks/1518875088630317056/VfzprlJYnbUMiR_Kqw7SCafrAyx5v8HIRAORW7_XypwxCq-8E36JZEQM0NMs0rGHnNSN" -- Replace with your actual webhook URL
-local CHECK_INTERVAL = 300 -- 5 minutes in seconds
+-- CONFIG
+local WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL_HERE"  -- <-- CHANGE THIS
+local CHECK_INTERVAL = 300  -- 5 minutes
 
--- State variables
+-- State
 local lastData = {}
-local currentData = {}
 local lastCheckTime = 0
 
--- Function to get a nil instance (helper function)
-local function getNil(name, class)
-    for _, v in next, getnilinstances() do
-        if v.ClassName == class and v.Name == name then
-            return v
-        end
+-- Helper: safely get text from a GUI object path
+local function getText(obj, ...)
+    if not obj then return nil end
+    local current = obj
+    for _, childName in ipairs({...}) do
+        current = current:FindFirstChild(childName)
+        if not current then return nil end
+    end
+    if current:IsA("TextLabel") or current:IsA("TextButton") then
+        return current.Text
     end
     return nil
 end
 
--- Function to safely get text from a GUI path
-local function getTextFromPath(path)
-    local success, result = pcall(function()
-        local current = path[1]
-        for i = 2, #path do
-            current = current[path[i]]
-        end
-        if current and current:IsA("TextLabel") or current:IsA("TextButton") then
-            return current.Text
-        end
-        return nil
-    end)
-    if success then
-        return result
-    end
-    return nil
-end
-
--- Function to get guild info
+-- Main data gathering – wrapped in pcall to prevent crashes
 local function getGuildInfo()
     local info = {
         guildName = "Unknown",
-        tag = "Unknown",
+        tag = "???",
         score = "0",
-        rank = "Unknown",
+        rank = "N/A",
         memberCount = "0",
         members = {}
     }
-    
-    -- Check if the GUI exists
-    local viewGuildPage = LocalPlayer.PlayerGui:FindFirstChild("ViewGuildPage")
-    if not viewGuildPage then return info end
-    
-    local mainPage = viewGuildPage:FindFirstChild("MainPage")
-    if not mainPage then return info end
-    
-    local content = mainPage:FindFirstChild("Content")
-    if not content then return info end
-    
-    -- Get guild name and rank
-    local guildNameRank = content:FindFirstChild("GuildName_Rank")
-    if guildNameRank and (guildNameRank:IsA("TextLabel") or guildNameRank:IsA("TextButton")) then
-        local text = guildNameRank.Text
-        -- Parse guild name and rank from text (format: "GuildName [TAG]")
-        local tagMatch = string.match(text, "%[(.-)%]")
-        if tagMatch then
-            info.tag = tagMatch
-            info.guildName = string.match(text, "^(.-)%s*%[")
-        else
-            info.guildName = text
-        end
-    end
-    
-    -- Get total contribution and rank
-    local guildInfo = content:FindFirstChild("GuildInfo")
-    if guildInfo then
-        local totalContribution = guildInfo:FindFirstChild("TotalContribution")
-        if totalContribution and (totalContribution:IsA("TextLabel") or totalContribution:IsA("TextButton")) then
-            local text = totalContribution.Text
-            -- Parse score and rank from text like "Score: 69.41M  •  Rank #11,092"
-            local scoreMatch = string.match(text, "Score:%s*(.-)%s*•")
-            local rankMatch = string.match(text, "Rank%s*#(%d+,?%d*)")
-            if scoreMatch then
-                info.score = string.gsub(scoreMatch, "%s", "")
-            end
-            if rankMatch then
-                info.rank = "#" .. rankMatch
+
+    local success, result = pcall(function()
+        local gui = LocalPlayer.PlayerGui
+        if not gui then return end
+
+        local viewPage = gui:FindFirstChild("ViewGuildPage")
+        if not viewPage or not viewPage.Visible then return end
+
+        local main = viewPage:FindFirstChild("MainPage")
+        if not main then return end
+
+        local content = main:FindFirstChild("Content")
+        if not content then return end
+
+        -- Guild name & tag
+        local nameRank = content:FindFirstChild("GuildName_Rank")
+        if nameRank then
+            local txt = nameRank.Text or ""
+            local tag = string.match(txt, "%[(.-)%]")
+            if tag then
+                info.tag = tag
+                info.guildName = string.match(txt, "^(.-)%s*%[") or txt
+            else
+                info.guildName = txt
             end
         end
-    end
-    
-    -- Get member count
-    local memberCountText = content:FindFirstChild("MemberCountTextLabel1")
-    if memberCountText and (memberCountText:IsA("TextLabel") or memberCountText:IsA("TextButton")) then
-        info.memberCount = memberCountText.Text
-    end
-    
-    -- Get members from scrolling frame
-    local scrollingFrame = content:FindFirstChild("ScrollingFrame")
-    if scrollingFrame then
-        -- Get all member frames
-        local memberFrames = {}
-        for _, child in ipairs(scrollingFrame:GetChildren()) do
-            if child:IsA("Frame") and string.match(child.Name, "^Member_%d+$") then
-                table.insert(memberFrames, child)
+
+        -- Total contribution & rank
+        local guildInfo = content:FindFirstChild("GuildInfo")
+        if guildInfo then
+            local total = guildInfo:FindFirstChild("TotalContribution")
+            if total then
+                local txt = total.Text or ""
+                local score = string.match(txt, "Score:%s*(.-)%s*•")
+                local rank = string.match(txt, "Rank%s*#(%d+,?%d*)")
+                if score then info.score = string.gsub(score, "%s", "") end
+                if rank then info.rank = "#" .. rank end
             end
         end
-        
-        -- Sort members by name (optional)
-        table.sort(memberFrames, function(a, b)
-            return a.Name < b.Name
-        end)
-        
-        -- Get each member's username and weekly contribution
-        for _, memberFrame in ipairs(memberFrames) do
-            local containerFrame = memberFrame:FindFirstChild("ContainerFrame")
-            if containerFrame then
-                -- Get username
-                local usernameLabel = containerFrame:FindFirstChild("Username")
-                local username = "Unknown"
-                if usernameLabel and (usernameLabel:IsA("TextLabel") or usernameLabel:IsA("TextButton")) then
-                    username = usernameLabel.Text
-                end
-                
-                -- Get weekly contribution
-                local contributions = containerFrame:FindFirstChild("Contributions")
-                local weeklyContribution = "0"
-                if contributions then
-                    local weeklyLabel = contributions:FindFirstChild("Weekly")
-                    if weeklyLabel then
-                        local textLabel = weeklyLabel:FindFirstChild("TextLabel")
-                        if textLabel and textLabel:IsA("TextLabel") then
-                            weeklyContribution = textLabel.Text
-                        end
+
+        -- Member count
+        local countLabel = content:FindFirstChild("MemberCountTextLabel1")
+        if countLabel then
+            info.memberCount = countLabel.Text or "0"
+        end
+
+        -- Members list
+        local scroll = content:FindFirstChild("ScrollingFrame")
+        if scroll then
+            for _, child in ipairs(scroll:GetChildren()) do
+                if child:IsA("Frame") and string.match(child.Name, "^Member_%d+$") then
+                    local container = child:FindFirstChild("ContainerFrame")
+                    if container then
+                        local username = getText(container, "Username") or "Unknown"
+                        local weekly = getText(container, "Contributions", "Weekly", "TextLabel") or "0"
+                        table.insert(info.members, {
+                            username = username,
+                            contribution = weekly
+                        })
                     end
                 end
-                
-                -- Add to members list
-                table.insert(info.members, {
-                    username = username,
-                    contribution = weeklyContribution
-                })
             end
+            -- Sort members by name (optional)
+            table.sort(info.members, function(a, b)
+                return a.username < b.username
+            end)
         end
-    end
-    
+    end)
+
     return info
 end
 
--- Function to compare two data tables for changes
-local function hasDataChanged(oldData, newData)
-    if not oldData or not newData then return true end
-    
-    if oldData.guildName ~= newData.guildName then return true end
-    if oldData.tag ~= newData.tag then return true end
-    if oldData.score ~= newData.score then return true end
-    if oldData.rank ~= newData.rank then return true end
-    if oldData.memberCount ~= newData.memberCount then return true end
-    
-    if #oldData.members ~= #newData.members then return true end
-    
-    for i = 1, #oldData.members do
-        if oldData.members[i].username ~= newData.members[i].username then return true end
-        if oldData.members[i].contribution ~= newData.members[i].contribution then return true end
+-- Check if data changed (deep compare)
+local function hasDataChanged(old, new)
+    if not old or not new then return true end
+    if old.guildName ~= new.guildName then return true end
+    if old.tag ~= new.tag then return true end
+    if old.score ~= new.score then return true end
+    if old.rank ~= new.rank then return true end
+    if old.memberCount ~= new.memberCount then return true end
+    if #old.members ~= #new.members then return true end
+    for i = 1, #old.members do
+        if old.members[i].username ~= new.members[i].username then return true end
+        if old.members[i].contribution ~= new.members[i].contribution then return true end
     end
-    
     return false
 end
 
--- Function to format the message for Discord
+-- Format Discord message
 local function formatMessage(data)
     if not data or #data.members == 0 then
-        return "No guild data available"
+        return "No guild data available (or guild page not open)."
     end
-    
-    local message = string.format(
-        "**[%s] %s**\n" ..
-        "Score: %s  •  Rank: %s\n" ..
-        "Members: %s\n" ..
-        "─────────────────\n",
-        data.tag or "???",
-        data.guildName or "Unknown",
-        data.score or "0",
-        data.rank or "N/A",
-        data.memberCount or "0"
-    )
-    
-    -- Add member list
-    local memberLines = {}
-    for _, member in ipairs(data.members) do
-        table.insert(memberLines, string.format(
-            "%s     %s",
-            member.username or "Unknown",
-            member.contribution or "0"
-        ))
-    end
-    
-    -- If we have too many members, limit the list
-    if #memberLines > 20 then
-        for i = 1, 20 do
-            message = message .. memberLines[i] .. "\n"
+
+    local lines = {
+        string.format("**[%s] %s**", data.tag or "???", data.guildName or "Unknown"),
+        string.format("Score: %s  •  Rank: %s", data.score or "0", data.rank or "N/A"),
+        string.format("Members: %s", data.memberCount or "0"),
+        "─────────────────"
+    }
+
+    -- Add up to 25 members to avoid message length limits
+    local maxMembers = 25
+    for i, m in ipairs(data.members) do
+        if i > maxMembers then
+            table.insert(lines, string.format("… and %d more", #data.members - maxMembers))
+            break
         end
-        message = message .. string.format("... and %d more members", #memberLines - 20)
-    else
-        message = message .. table.concat(memberLines, "\n")
+        table.insert(lines, string.format("%s     %s", m.username or "Unknown", m.contribution or "0"))
     end
-    
-    return message
+
+    return table.concat(lines, "\n")
 end
 
--- Function to send data to Discord webhook
+-- Send to Discord
 local function sendToDiscord(data)
     if WEBHOOK_URL == "YOUR_DISCORD_WEBHOOK_URL_HERE" then
-        warn("Please set your Discord webhook URL in the script!")
+        warn("⚠️  Please set your Discord webhook URL in the script!")
         return
     end
-    
+
     local message = formatMessage(data)
-    
-    local payload = {
-        content = message
-    }
-    
-    local jsonData = HttpService:JSONEncode(payload)
-    
-    local success, result = pcall(function()
-        return HttpService:PostAsync(WEBHOOK_URL, jsonData, Enum.HttpContentType.ApplicationJson)
+    local payload = HttpService:JSONEncode({ content = message })
+
+    local ok, err = pcall(function()
+        HttpService:PostAsync(WEBHOOK_URL, payload, Enum.HttpContentType.ApplicationJson)
     end)
-    
-    if not success then
-        warn("Failed to send webhook: " .. tostring(result))
+
+    if not ok then
+        warn("Failed to send webhook: " .. tostring(err))
     end
 end
 
--- Main update function
+-- Update function
 local function updateGuildInfo()
     local newData = getGuildInfo()
-    
-    -- Check if data has changed or if it's the first update
     if hasDataChanged(lastData, newData) then
-        currentData = newData
         sendToDiscord(newData)
-        lastData = table.clone(newData) -- Shallow clone for comparison
+        -- Deep copy
+        lastData = {
+            guildName = newData.guildName,
+            tag = newData.tag,
+            score = newData.score,
+            rank = newData.rank,
+            memberCount = newData.memberCount,
+            members = {}
+        }
+        for _, m in ipairs(newData.members) do
+            table.insert(lastData.members, {
+                username = m.username,
+                contribution = m.contribution
+            })
+        end
         lastCheckTime = tick()
     end
 end
 
--- Function to start the monitoring loop
+-- Start monitoring
 local function startMonitoring()
-    -- Initial update
-    updateGuildInfo()
-    
-    -- Set up interval check
+    print("Guild Info Monitor started. Updates every " .. CHECK_INTERVAL .. " seconds.")
+    updateGuildInfo() -- initial send
+
     game:GetService("RunService").Heartbeat:Connect(function()
         if tick() - lastCheckTime >= CHECK_INTERVAL then
             updateGuildInfo()
         end
     end)
-    
-    -- Also check for GUI changes (when the guild page is opened/refreshed)
-    local function onGuiChanged()
-        -- Small delay to allow GUI to update
-        task.wait(0.5)
-        updateGuildInfo()
+
+    -- Also trigger on GUI visibility change
+    local viewPage = LocalPlayer.PlayerGui:FindFirstChild("ViewGuildPage")
+    if viewPage then
+        viewPage:GetPropertyChangedSignal("Visible"):Connect(function()
+            wait(0.5) -- wait for UI to refresh
+            updateGuildInfo()
+        end)
     end
-    
-    -- Monitor for changes to the ViewGuildPage
-    local viewGuildPage = LocalPlayer.PlayerGui:FindFirstChild("ViewGuildPage")
-    if viewGuildPage then
-        viewGuildPage:GetPropertyChangedSignal("Visible"):Connect(onGuiChanged)
-    end
-    
-    print("Guild Info Monitor started! Sending updates every " .. CHECK_INTERVAL .. " seconds.")
-    print("Webhook URL: " .. WEBHOOK_URL)
 end
 
--- Check if we're in a game with the required GUI
-local function checkAndStart()
-    local success = pcall(function()
-        local viewGuildPage = LocalPlayer.PlayerGui:FindFirstChild("ViewGuildPage")
-        if viewGuildPage then
+-- Wait for GUI to appear
+local function waitForGuildPage()
+    local gui = LocalPlayer.PlayerGui
+    if gui and gui:FindFirstChild("ViewGuildPage") then
+        startMonitoring()
+        return
+    end
+
+    print("Waiting for ViewGuildPage to appear...")
+    local conn
+    conn = gui.ChildAdded:Connect(function(child)
+        if child.Name == "ViewGuildPage" then
+            conn:Disconnect()
+            wait(1)
             startMonitoring()
-        else
-            -- Wait for the GUI to appear
-            print("Waiting for ViewGuildPage to appear...")
-            local guiAddedConnection
-            guiAddedConnection = LocalPlayer.PlayerGui.ChildAdded:Connect(function(child)
-                if child.Name == "ViewGuildPage" then
-                    guiAddedConnection:Disconnect()
-                    task.wait(1) -- Wait for GUI to fully load
-                    startMonitoring()
-                end
-            end)
-            
-            -- Timeout after 30 seconds if GUI doesn't appear
-            task.wait(30)
-            if not guiAddedConnection then
-                print("Timeout: ViewGuildPage not found. Make sure you're in a guild.")
-            end
         end
     end)
-    
-    if not success then
-        warn("Failed to start monitoring: " .. tostring(pcall(function() error("") end))
+
+    -- Timeout after 30s
+    wait(30)
+    if conn and conn.Connected then
+        conn:Disconnect()
+        print("Timeout: ViewGuildPage not found. Make sure you're in a guild.")
     end
 end
 
--- Start the script
-print("Guild Info Webhook Script loaded!")
-checkAndStart()
+-- Run
+waitForGuildPage()
