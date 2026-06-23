@@ -216,6 +216,45 @@ local function formatMessage(data)
     return message
 end
 
+-- Resolve the best available HTTP function for this executor.
+-- Roblox's HttpService:PostAsync is sometimes blocked depending on the
+-- calling thread context, so prefer the executor's own request function
+-- (http_request / request / syn.request) when present.
+local function doHttpPost(url, jsonBody)
+    local requestFn = (typeof(http_request) == "function" and http_request)
+        or (typeof(request) == "function" and request)
+        or (typeof(syn) == "table" and typeof(syn.request) == "function" and syn.request)
+
+    if requestFn then
+        local success, response = pcall(requestFn, {
+            Url = url,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = jsonBody
+        })
+        return success, response
+    end
+
+    -- Fallback to native Roblox HttpService. Spawned on a fresh thread
+    -- since PostAsync is sometimes blocked when called from inside a
+    -- RunService connection callback's thread on some executors.
+    local success, result
+    task.spawn(function()
+        success, result = pcall(function()
+            return HttpService:PostAsync(url, jsonBody, Enum.HttpContentType.ApplicationJson)
+        end)
+    end)
+
+    -- Give the spawned thread a moment to run before we report status.
+    local waited = 0
+    while success == nil and waited < 5 do
+        task.wait(0.1)
+        waited += 0.1
+    end
+
+    return success or false, result
+end
+
 -- Function to send data to Discord webhook
 local function sendToDiscord(data)
     if WEBHOOK_URL == "YOUR_DISCORD_WEBHOOK_URL_HERE" then
@@ -231,9 +270,7 @@ local function sendToDiscord(data)
     
     local jsonData = HttpService:JSONEncode(payload)
     
-    local success, result = pcall(function()
-        return HttpService:PostAsync(WEBHOOK_URL, jsonData, Enum.HttpContentType.ApplicationJson)
-    end)
+    local success, result = doHttpPost(WEBHOOK_URL, jsonData)
     
     if not success then
         warn("Failed to send webhook: " .. tostring(result))
@@ -272,10 +309,18 @@ local function startMonitoring()
         updateGuildInfo()
     end
     
-    -- Monitor for changes to the ViewGuildPage
+    -- Monitor for changes to the ViewGuildPage.
+    -- Wrapped in pcall since "Visible" isn't guaranteed to exist on every
+    -- instance type (e.g. Folder), and we don't want that to break the
+    -- rest of startMonitoring if it's missing.
     local viewGuildPage = LocalPlayer.PlayerGui:FindFirstChild("ViewGuildPage")
     if viewGuildPage then
-        viewGuildPage:GetPropertyChangedSignal("Visible"):Connect(onGuiChanged)
+        local watchSuccess, watchErr = pcall(function()
+            viewGuildPage:GetPropertyChangedSignal("Visible"):Connect(onGuiChanged)
+        end)
+        if not watchSuccess then
+            warn("Could not watch ViewGuildPage.Visible (skipping): " .. tostring(watchErr))
+        end
     end
     
     print("Guild Info Monitor started! Sending updates every " .. CHECK_INTERVAL .. " seconds.")
