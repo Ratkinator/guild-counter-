@@ -25,6 +25,44 @@ local function getNil(name, class)
     return nil
 end
 
+-- Strip RichText tags (e.g. <font color="...">text</font>) since these GUIs use RichText
+local function stripRichText(text)
+    if not text then return text end
+    return (string.gsub(text, "<[^>]->", ""))
+end
+
+-- Many of these GUI containers are Frames that hold the actual text in a
+-- child TextLabel/TextButton (e.g. GuildName_Rank.TextLabel), rather than
+-- being a text object themselves. This pulls text from a named child object
+-- if it's directly a text object, or from its first TextLabel/TextButton
+-- descendant otherwise. Works regardless of GUI Visible state since it's
+-- pure instance-tree indexing, same as Dex.
+local function getTextFrom(parent, childName)
+    if not parent then return nil end
+    local obj = parent:FindFirstChild(childName)
+    if not obj then return nil end
+
+    if obj:IsA("TextLabel") or obj:IsA("TextButton") then
+        return stripRichText(obj.Text)
+    end
+
+    local nested = obj:FindFirstChildWhichIsA("TextLabel")
+        or obj:FindFirstChildWhichIsA("TextButton")
+        or obj:FindFirstChildOfClass("TextLabel")
+        or obj:FindFirstChildOfClass("TextButton")
+    if nested then
+        return stripRichText(nested.Text)
+    end
+
+    -- Fall back to a deeper search in case the text object isn't a direct child
+    local descendant = obj:FindFirstChild("TextLabel", true) or obj:FindFirstChild("TextButton", true)
+    if descendant then
+        return stripRichText(descendant.Text)
+    end
+
+    return nil
+end
+
 -- Function to safely get text from a GUI path
 local function getTextFromPath(path)
     local success, result = pcall(function()
@@ -54,7 +92,8 @@ local function getGuildInfo()
         members = {}
     }
     
-    -- Check if the GUI exists
+    -- This reads straight from the instance tree (like Dex does), so it
+    -- works whether or not ViewGuildPage is currently Visible on screen.
     local viewGuildPage = LocalPlayer.PlayerGui:FindFirstChild("ViewGuildPage")
     if not viewGuildPage then return info end
     
@@ -64,45 +103,46 @@ local function getGuildInfo()
     local content = mainPage:FindFirstChild("Content")
     if not content then return info end
     
-    -- Get guild name and rank
-    local guildNameRank = content:FindFirstChild("GuildName_Rank")
-    if guildNameRank and (guildNameRank:IsA("TextLabel") or guildNameRank:IsA("TextButton")) then
-        local text = guildNameRank.Text
-        -- Parse guild name and rank from text (format: "GuildName [TAG]")
-        local tagMatch = string.match(text, "%[(.-)%]")
+    -- GuildInfo wraps both GuildName_Rank and TotalContribution
+    local guildInfo = content:FindFirstChild("GuildInfo")
+    
+    -- Get guild name and tag
+    -- Path: Content.GuildInfo.GuildName_Rank.TextLabel
+    local nameRankText = getTextFrom(guildInfo, "GuildName_Rank")
+    if nameRankText then
+        -- Parse guild name and tag from text (format: "GuildName [TAG]")
+        local tagMatch = string.match(nameRankText, "%[(.-)%]")
         if tagMatch then
             info.tag = tagMatch
-            info.guildName = string.match(text, "^(.-)%s*%[")
+            info.guildName = string.match(nameRankText, "^(.-)%s*%[") or nameRankText
         else
-            info.guildName = text
+            info.guildName = nameRankText
         end
     end
     
     -- Get total contribution and rank
-    local guildInfo = content:FindFirstChild("GuildInfo")
-    if guildInfo then
-        local totalContribution = guildInfo:FindFirstChild("TotalContribution")
-        if totalContribution and (totalContribution:IsA("TextLabel") or totalContribution:IsA("TextButton")) then
-            local text = totalContribution.Text
-            -- Parse score and rank from text like "Score: 69.41M  •  Rank #11,092"
-            local scoreMatch = string.match(text, "Score:%s*(.-)%s*•")
-            local rankMatch = string.match(text, "Rank%s*#(%d+,?%d*)")
-            if scoreMatch then
-                info.score = string.gsub(scoreMatch, "%s", "")
-            end
-            if rankMatch then
-                info.rank = "#" .. rankMatch
-            end
+    -- Path: Content.GuildInfo.TotalContribution.TextLabel
+    local contributionText = getTextFrom(guildInfo, "TotalContribution")
+    if contributionText then
+        -- Parse score and rank from text like "Score: 69.41M  •  Rank #11,092"
+        local scoreMatch = string.match(contributionText, "Score:%s*(.-)%s*•")
+        local rankMatch = string.match(contributionText, "Rank%s*#(%d+,?%d*)")
+        if scoreMatch then
+            info.score = string.gsub(scoreMatch, "%s", "")
+        end
+        if rankMatch then
+            info.rank = "#" .. rankMatch
         end
     end
     
     -- Get member count
-    local memberCountText = content:FindFirstChild("MemberCountTextLabel1")
-    if memberCountText and (memberCountText:IsA("TextLabel") or memberCountText:IsA("TextButton")) then
-        info.memberCount = memberCountText.Text
+    local memberCountText = getTextFrom(content, "MemberCountTextLabel1")
+    if memberCountText then
+        info.memberCount = memberCountText
     end
     
     -- Get members from scrolling frame
+    -- Path: Content.ScrollingFrame.Member_<id>.ContainerFrame
     local scrollingFrame = content:FindFirstChild("ScrollingFrame")
     if scrollingFrame then
         -- Get all member frames
@@ -118,33 +158,31 @@ local function getGuildInfo()
             return a.Name < b.Name
         end)
         
-        -- Get each member's username and weekly contribution
+        -- Get each member's username, role/rank, and weekly contribution
         for _, memberFrame in ipairs(memberFrames) do
             local containerFrame = memberFrame:FindFirstChild("ContainerFrame")
             if containerFrame then
                 -- Get username
-                local usernameLabel = containerFrame:FindFirstChild("Username")
-                local username = "Unknown"
-                if usernameLabel and (usernameLabel:IsA("TextLabel") or usernameLabel:IsA("TextButton")) then
-                    username = usernameLabel.Text
-                end
+                local username = getTextFrom(containerFrame, "Username") or "Unknown"
+                
+                -- Get role/rank (e.g. Owner, Officer, Member)
+                -- Path: ContainerFrame.Role_Rank
+                local roleRank = getTextFrom(containerFrame, "Role_Rank") or "Unknown"
                 
                 -- Get weekly contribution
                 local contributions = containerFrame:FindFirstChild("Contributions")
                 local weeklyContribution = "0"
                 if contributions then
-                    local weeklyLabel = contributions:FindFirstChild("Weekly")
-                    if weeklyLabel then
-                        local textLabel = weeklyLabel:FindFirstChild("TextLabel")
-                        if textLabel and textLabel:IsA("TextLabel") then
-                            weeklyContribution = textLabel.Text
-                        end
+                    local weeklyText = getTextFrom(contributions, "Weekly")
+                    if weeklyText then
+                        weeklyContribution = weeklyText
                     end
                 end
                 
                 -- Add to members list
                 table.insert(info.members, {
                     username = username,
+                    role = roleRank,
                     contribution = weeklyContribution
                 })
             end
@@ -169,6 +207,7 @@ local function hasDataChanged(oldData, newData)
     
     for i = 1, #oldData.members do
         if oldData.members[i].username ~= newData.members[i].username then return true end
+        if oldData.members[i].role ~= newData.members[i].role then return true end
         if oldData.members[i].contribution ~= newData.members[i].contribution then return true end
     end
     
@@ -197,8 +236,9 @@ local function formatMessage(data)
     local memberLines = {}
     for _, member in ipairs(data.members) do
         table.insert(memberLines, string.format(
-            "%s     %s",
+            "%s [%s]     %s",
             member.username or "Unknown",
+            member.role or "Unknown",
             member.contribution or "0"
         ))
     end
@@ -284,7 +324,7 @@ local function updateGuildInfo()
     -- Check if data has changed or if it's the first update
     if hasDataChanged(lastData, newData) then
         currentData = newData
-        sendToDiscord(newData)
+        task.spawn(sendToDiscord, newData)
         lastData = table.clone(newData) -- Shallow clone for comparison
         lastCheckTime = tick()
     end
