@@ -266,13 +266,6 @@ local function getGuildInfo()
                     end
                 end
                 
-                -- Get member display image
-                -- Path: ContainerFrame.PlayerDisplay.MemberImage
-                local memberImage = getImageFrom(
-                    containerFrame:FindFirstChild("PlayerDisplay"),
-                    "MemberImage"
-                )
-                
                 -- Add to members list (keep both display text and parsed
                 -- numeric values so we can sort by rank # or contribution)
                 table.insert(info.members, {
@@ -280,8 +273,7 @@ local function getGuildInfo()
                     role = roleRank,
                     roleRankNumber = parseRoleRankNumber(roleRank),
                     contribution = weeklyContribution,
-                    contributionValue = parseAbbreviatedNumber(weeklyContribution),
-                    image = memberImage
+                    contributionValue = parseAbbreviatedNumber(weeklyContribution)
                 })
             end
         end
@@ -326,12 +318,8 @@ local function hasDataChanged(oldData, newData)
 end
 
 -- Function to build a Discord embed payload from guild data.
--- Discord embeds can't color individual text runs (only the side bar via
--- `color`), and there's no per-line inline image slot in a single embed's
--- fields. To get a small avatar next to each member's name, each member
--- gets its own compact embed using `author` (icon_url renders small, right
--- next to the name — about emoji size). The main guild embed carries the
--- guild logo as a `thumbnail` (top-right corner image).
+-- Single embed: green side color, guild logo as the thumbnail (top-right
+-- corner image), and a member list field. No per-member avatars.
 local function buildEmbedPayload(data)
     if not data or not data.members or #data.members == 0 then
         return { { content = "No guild data available" } }
@@ -339,14 +327,60 @@ local function buildEmbedPayload(data)
     
     local GREEN = 0x2ECC71
     
+    local memberLines = {}
+    for i, member in ipairs(data.members) do
+        table.insert(memberLines, string.format(
+            "**%d.** %s `[%s]` — %s",
+            i,
+            member.username or "Unknown",
+            member.role or "Unknown",
+            member.contribution or "0"
+        ))
+    end
+    
+    -- Discord field values are capped at 1024 characters, so split the
+    -- member list across multiple fields if it's long.
+    local memberFields = {}
+    local currentChunk = {}
+    local currentLength = 0
+    local fieldIndex = 1
+    
+    for _, line in ipairs(memberLines) do
+        local lineLength = #line + 1 -- +1 for the newline
+        if currentLength + lineLength > 1000 then
+            table.insert(memberFields, {
+                name = fieldIndex == 1 and "Members" or "Members (cont.)",
+                value = table.concat(currentChunk, "\n"),
+                inline = false
+            })
+            currentChunk = {}
+            currentLength = 0
+            fieldIndex = fieldIndex + 1
+        end
+        table.insert(currentChunk, line)
+        currentLength = currentLength + lineLength
+    end
+    if #currentChunk > 0 then
+        table.insert(memberFields, {
+            name = fieldIndex == 1 and "Members" or "Members (cont.)",
+            value = table.concat(currentChunk, "\n"),
+            inline = false
+        })
+    end
+    
+    local fields = {
+        { name = "Score", value = tostring(data.score or "0"), inline = true },
+        { name = "Guild Rank", value = tostring(data.rank or "N/A"), inline = true },
+        { name = "Member Count", value = tostring(data.memberCount or "0"), inline = true }
+    }
+    for _, f in ipairs(memberFields) do
+        table.insert(fields, f)
+    end
+    
     local mainEmbed = {
         title = string.format("[%s] %s", data.tag or "???", data.guildName or "Unknown"),
         color = GREEN,
-        fields = {
-            { name = "Score", value = tostring(data.score or "0"), inline = true },
-            { name = "Guild Rank", value = tostring(data.rank or "N/A"), inline = true },
-            { name = "Member Count", value = tostring(data.memberCount or "0"), inline = true }
-        },
+        fields = fields,
         footer = { text = "Sorted by " .. (MEMBER_SORT_MODE == "contribution" and "contribution (highest first)" or "guild rank") },
         timestamp = DateTime.now():ToIsoDate()
     }
@@ -356,48 +390,7 @@ local function buildEmbedPayload(data)
         mainEmbed.thumbnail = { url = guildImageUrl }
     end
     
-    local embeds = { mainEmbed }
-    
-    -- One small embed per member: avatar (emoji-sized via author icon_url)
-    -- + name + role + contribution, all on one compact line.
-    for i, member in ipairs(data.members) do
-        local memberEmbed = {
-            description = string.format(
-                "**%d.** `[%s]` — %s",
-                i,
-                member.role or "Unknown",
-                member.contribution or "0"
-            ),
-            color = GREEN,
-            author = {
-                name = member.username or "Unknown"
-            }
-        }
-        
-        local memberImageUrl = toDiscordImageUrl(member.image)
-        if memberImageUrl then
-            memberEmbed.author.icon_url = memberImageUrl
-        end
-        
-        table.insert(embeds, memberEmbed)
-    end
-    
-    -- Discord caps a single message at 10 embeds, so split into multiple
-    -- webhook payloads if the guild has more than 9 members (1 main + 9).
-    local payloads = {}
-    local chunk = { embeds[1] }
-    for i = 2, #embeds do
-        table.insert(chunk, embeds[i])
-        if #chunk >= 10 then
-            table.insert(payloads, { embeds = chunk })
-            chunk = {}
-        end
-    end
-    if #chunk > 0 then
-        table.insert(payloads, { embeds = chunk })
-    end
-    
-    return payloads
+    return { { embeds = { mainEmbed } } }
 end
 
 -- Resolve the best available HTTP function for this executor.
