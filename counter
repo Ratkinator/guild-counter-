@@ -105,6 +105,48 @@ local function parseRoleRankNumber(roleText)
     return num and tonumber(num) or math.huge
 end
 
+-- Pulls the Image asset url from a named ImageLabel/ImageButton child, or
+-- from its first ImageLabel/ImageButton descendant if the named object
+-- itself isn't an image (mirrors getTextFrom's behavior for images).
+local function getImageFrom(parent, childName)
+    if not parent then return nil end
+    local obj = parent:FindFirstChild(childName)
+    if not obj then return nil end
+
+    if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then
+        if obj.Image and obj.Image ~= "" then
+            return obj.Image
+        end
+    end
+
+    local nested = obj:FindFirstChildWhichIsA("ImageLabel")
+        or obj:FindFirstChildWhichIsA("ImageButton")
+        or obj:FindFirstChildOfClass("ImageLabel")
+        or obj:FindFirstChildOfClass("ImageButton")
+    if nested and nested.Image and nested.Image ~= "" then
+        return nested.Image
+    end
+
+    local descendant = obj:FindFirstChild("ImageLabel", true) or obj:FindFirstChild("ImageButton", true)
+    if descendant and descendant.Image and descendant.Image ~= "" then
+        return descendant.Image
+    end
+
+    return nil
+end
+
+-- Discord can't render rbxassetid:// URIs directly, so convert them into
+-- a real https thumbnail URL via Roblox's asset thumbnail endpoint.
+local function toDiscordImageUrl(robloxImage)
+    if not robloxImage or robloxImage == "" then return nil end
+    local assetId = string.match(robloxImage, "rbxassetid://(%d+)")
+    if not assetId then return nil end
+    return string.format(
+        "https://www.roblox.com/asset-thumbnail/image?assetId=%s&width=420&height=420&format=png",
+        assetId
+    )
+end
+
 -- Function to get guild info
 local function getGuildInfo()
     local info = {
@@ -157,6 +199,13 @@ local function getGuildInfo()
             info.guildName = nameRankText
         end
     end
+    
+    -- Get guild logo image
+    -- Path: Content.GuildInfo.BeanstalkDisplay.BeanstalkSkinImage
+    info.guildImage = getImageFrom(
+        guildInfo and guildInfo:FindFirstChild("BeanstalkDisplay"),
+        "BeanstalkSkinImage"
+    )
     
     -- Get total contribution and rank
     -- Path: Content.GuildInfo.TotalContribution.TextLabel
@@ -217,6 +266,13 @@ local function getGuildInfo()
                     end
                 end
                 
+                -- Get member display image
+                -- Path: ContainerFrame.PlayerDisplay.MemberImage
+                local memberImage = getImageFrom(
+                    containerFrame:FindFirstChild("PlayerDisplay"),
+                    "MemberImage"
+                )
+                
                 -- Add to members list (keep both display text and parsed
                 -- numeric values so we can sort by rank # or contribution)
                 table.insert(info.members, {
@@ -224,7 +280,8 @@ local function getGuildInfo()
                     role = roleRank,
                     roleRankNumber = parseRoleRankNumber(roleRank),
                     contribution = weeklyContribution,
-                    contributionValue = parseAbbreviatedNumber(weeklyContribution)
+                    contributionValue = parseAbbreviatedNumber(weeklyContribution),
+                    image = memberImage
                 })
             end
         end
@@ -269,76 +326,78 @@ local function hasDataChanged(oldData, newData)
 end
 
 -- Function to build a Discord embed payload from guild data.
--- Discord embeds support up to 25 fields and ~6000 total characters, so
--- members are grouped into a couple of fields to stay well within limits.
+-- Discord embeds can't color individual text runs (only the side bar via
+-- `color`), and there's no per-line inline image slot in a single embed's
+-- fields. To get a small avatar next to each member's name, each member
+-- gets its own compact embed using `author` (icon_url renders small, right
+-- next to the name — about emoji size). The main guild embed carries the
+-- guild logo as a `thumbnail` (top-right corner image).
 local function buildEmbedPayload(data)
     if not data or not data.members or #data.members == 0 then
-        return {
-            content = "No guild data available"
-        }
+        return { { content = "No guild data available" } }
     end
     
-    local memberLines = {}
-    for i, member in ipairs(data.members) do
-        table.insert(memberLines, string.format(
-            "**%d.** %s `[%s]` — %s",
-            i,
-            member.username or "Unknown",
-            member.role or "Unknown",
-            member.contribution or "0"
-        ))
-    end
+    local GREEN = 0x2ECC71
     
-    -- Discord field values are capped at 1024 characters, so split the
-    -- member list across multiple fields if it's long.
-    local memberFields = {}
-    local currentChunk = {}
-    local currentLength = 0
-    local fieldIndex = 1
-    
-    for _, line in ipairs(memberLines) do
-        local lineLength = #line + 1 -- +1 for the newline
-        if currentLength + lineLength > 1000 then
-            table.insert(memberFields, {
-                name = fieldIndex == 1 and "Members" or "Members (cont.)",
-                value = table.concat(currentChunk, "\n"),
-                inline = false
-            })
-            currentChunk = {}
-            currentLength = 0
-            fieldIndex = fieldIndex + 1
-        end
-        table.insert(currentChunk, line)
-        currentLength = currentLength + lineLength
-    end
-    if #currentChunk > 0 then
-        table.insert(memberFields, {
-            name = fieldIndex == 1 and "Members" or "Members (cont.)",
-            value = table.concat(currentChunk, "\n"),
-            inline = false
-        })
-    end
-    
-    local fields = {
-        { name = "Score", value = tostring(data.score or "0"), inline = true },
-        { name = "Guild Rank", value = tostring(data.rank or "N/A"), inline = true },
-        { name = "Member Count", value = tostring(data.memberCount or "0"), inline = true }
-    }
-    for _, f in ipairs(memberFields) do
-        table.insert(fields, f)
-    end
-    
-    local embed = {
+    local mainEmbed = {
         title = string.format("[%s] %s", data.tag or "???", data.guildName or "Unknown"),
-        color = 0x5865F2, -- Discord blurple
-        fields = fields,
+        color = GREEN,
+        fields = {
+            { name = "Score", value = tostring(data.score or "0"), inline = true },
+            { name = "Guild Rank", value = tostring(data.rank or "N/A"), inline = true },
+            { name = "Member Count", value = tostring(data.memberCount or "0"), inline = true }
+        },
         footer = { text = "Sorted by " .. (MEMBER_SORT_MODE == "contribution" and "contribution (highest first)" or "guild rank") },
         timestamp = DateTime.now():ToIsoDate()
     }
     
-    return {
-        embeds = { embed }
-    }
+    local guildImageUrl = toDiscordImageUrl(data.guildImage)
+    if guildImageUrl then
+        mainEmbed.thumbnail = { url = guildImageUrl }
+    end
+    
+    local embeds = { mainEmbed }
+    
+    -- One small embed per member: avatar (emoji-sized via author icon_url)
+    -- + name + role + contribution, all on one compact line.
+    for i, member in ipairs(data.members) do
+        local memberEmbed = {
+            description = string.format(
+                "**%d.** `[%s]` — %s",
+                i,
+                member.role or "Unknown",
+                member.contribution or "0"
+            ),
+            color = GREEN,
+            author = {
+                name = member.username or "Unknown"
+            }
+        }
+        
+        local memberImageUrl = toDiscordImageUrl(member.image)
+        if memberImageUrl then
+            memberEmbed.author.icon_url = memberImageUrl
+        end
+        
+        table.insert(embeds, memberEmbed)
+    end
+    
+    -- Discord caps a single message at 10 embeds, so split into multiple
+    -- webhook payloads if the guild has more than 9 members (1 main + 9).
+    local payloads = {}
+    local chunk = { embeds[1] }
+    for i = 2, #embeds do
+        table.insert(chunk, embeds[i])
+        if #chunk >= 10 then
+            table.insert(payloads, { embeds = chunk })
+            chunk = {}
+        end
+    end
+    if #chunk > 0 then
+        table.insert(payloads, { embeds = chunk })
+    end
+    
+    return payloads
 end
 
 -- Resolve the best available HTTP function for this executor.
@@ -387,14 +446,15 @@ local function sendToDiscord(data)
         return
     end
     
-    local payload = buildEmbedPayload(data)
+    local payloads = buildEmbedPayload(data)
     
-    local jsonData = HttpService:JSONEncode(payload)
-    
-    local success, result = doHttpPost(WEBHOOK_URL, jsonData)
-    
-    if not success then
-        warn("Failed to send webhook: " .. tostring(result))
+    for _, payload in ipairs(payloads) do
+        local jsonData = HttpService:JSONEncode(payload)
+        local success, result = doHttpPost(WEBHOOK_URL, jsonData)
+        if not success then
+            warn("Failed to send webhook: " .. tostring(result))
+        end
+        task.wait(0.5) -- small delay between requests to avoid rate limiting
     end
 end
 
