@@ -15,6 +15,7 @@ local MEMBER_SORT_MODE = "rank" -- "rank" = sort by #1, #2, #3...   "contributio
 local lastData = {}
 local currentData = {}
 local lastCheckTime = 0
+local sentMessageId = nil -- Discord message ID of the embed we've sent, so later updates edit it instead of posting a new one
 
 -- Function to get a nil instance (helper function)
 local function getNil(name, class)
@@ -393,11 +394,31 @@ local function buildEmbedPayload(data)
     return { { embeds = { mainEmbed } } }
 end
 
+-- Checks whether a response table indicates an HTTP-level success.
+-- Different executors expose this differently: .Success (boolean), or
+-- .StatusCode in the 200-299 range. Falls back to true if neither field
+-- is present (e.g. HttpService:PostAsync just returns the body directly
+-- and throws on failure instead, which pcall already catches).
+local function isHttpSuccess(response)
+    if typeof(response) ~= "table" then
+        return true
+    end
+    if response.Success ~= nil then
+        return response.Success
+    end
+    if response.StatusCode then
+        return response.StatusCode >= 200 and response.StatusCode < 300
+    end
+    return true
+end
+
 -- Resolve the best available HTTP function for this executor.
 -- Roblox's HttpService:PostAsync is sometimes blocked depending on the
 -- calling thread context, so prefer the executor's own request function
--- (http_request / request / syn.request) when present.
-local function doHttpPost(url, jsonBody)
+-- (http_request / request / syn.request) when present. Supports both POST
+-- (initial send) and PATCH (editing an existing message) since editing the
+-- webhook message requires PATCH /webhooks/{id}/{token}/messages/{message_id}.
+local function doHttpRequest(method, url, jsonBody)
     local requestFn = (typeof(http_request) == "function" and http_request)
         or (typeof(request) == "function" and request)
         or (typeof(syn) == "table" and typeof(syn.request) == "function" and syn.request)
@@ -405,21 +426,38 @@ local function doHttpPost(url, jsonBody)
     if requestFn then
         local success, response = pcall(requestFn, {
             Url = url,
-            Method = "POST",
+            Method = method,
             Headers = { ["Content-Type"] = "application/json" },
             Body = jsonBody
         })
+        if success and not isHttpSuccess(response) then
+            return false, response
+        end
         return success, response
     end
 
     -- Fallback to native Roblox HttpService. Spawned on a fresh thread
-    -- since PostAsync is sometimes blocked when called from inside a
-    -- RunService connection callback's thread on some executors.
+    -- since PostAsync/RequestAsync is sometimes blocked when called from
+    -- inside a RunService connection callback's thread on some executors.
+    -- HttpService:PostAsync only supports POST, so PATCH falls back to
+    -- HttpService:RequestAsync, which supports arbitrary methods.
     local success, result
     task.spawn(function()
         success, result = pcall(function()
-            return HttpService:PostAsync(url, jsonBody, Enum.HttpContentType.ApplicationJson)
+            if method == "POST" then
+                return HttpService:PostAsync(url, jsonBody, Enum.HttpContentType.ApplicationJson)
+            else
+                return HttpService:RequestAsync({
+                    Url = url,
+                    Method = method,
+                    Headers = { ["Content-Type"] = "application/json" },
+                    Body = jsonBody
+                })
+            end
         end)
+        if success and not isHttpSuccess(result) then
+            success = false
+        end
     end)
 
     -- Give the spawned thread a moment to run before we report status.
@@ -432,7 +470,38 @@ local function doHttpPost(url, jsonBody)
     return success or false, result
 end
 
--- Function to send data to Discord webhook
+-- Builds the message-specific webhook URL for editing a previously sent
+-- message: PATCH /webhooks/{id}/{token}/messages/{message_id}
+local function buildEditUrl(webhookUrl, messageId)
+    -- Strip any existing query string before appending the message path
+    local base = string.match(webhookUrl, "^([^?]+)") or webhookUrl
+    return base .. "/messages/" .. messageId
+end
+
+-- Different executors/HttpService methods return the response body in
+-- different shapes: a raw string (HttpService:PostAsync), or a table with
+-- .Body / .body (request, http_request, syn.request, HttpService:RequestAsync).
+-- This normalizes all of them into a parsed JSON table, or nil on failure.
+local function extractJsonBody(result)
+    if typeof(result) == "string" then
+        local ok, parsed = pcall(HttpService.JSONDecode, HttpService, result)
+        if ok then return parsed end
+        return nil
+    end
+    if typeof(result) == "table" then
+        local bodyStr = result.Body or result.body
+        if bodyStr then
+            local ok, parsed = pcall(HttpService.JSONDecode, HttpService, bodyStr)
+            if ok then return parsed end
+        end
+    end
+    return nil
+end
+
+-- Function to send (or edit) the guild data embed on Discord.
+-- First send: POST with ?wait=true so Discord returns the message object,
+-- from which we grab the message id. Every send after that: PATCH the same
+-- message id instead of posting a new one, so the embed updates in place.
 local function sendToDiscord(data)
     if WEBHOOK_URL == "YOUR_DISCORD_WEBHOOK_URL_HERE" then
         warn("Please set your Discord webhook URL in the script!")
@@ -440,14 +509,34 @@ local function sendToDiscord(data)
     end
     
     local payloads = buildEmbedPayload(data)
+    local payload = payloads[1] -- only ever one embed payload now
+    local jsonData = HttpService:JSONEncode(payload)
     
-    for _, payload in ipairs(payloads) do
-        local jsonData = HttpService:JSONEncode(payload)
-        local success, result = doHttpPost(WEBHOOK_URL, jsonData)
+    if sentMessageId then
+        -- Edit the existing message in place
+        local editUrl = buildEditUrl(WEBHOOK_URL, sentMessageId)
+        local success, result = doHttpRequest("PATCH", editUrl, jsonData)
         if not success then
+            warn("Failed to edit webhook message: " .. tostring(result))
+            -- If editing failed (e.g. message was deleted on Discord's side),
+            -- clear the stored id so the next update posts a fresh message.
+            sentMessageId = nil
+        end
+    else
+        -- No message sent yet — post one and capture its id for future edits
+        local base = string.match(WEBHOOK_URL, "^([^?]+)") or WEBHOOK_URL
+        local postUrl = base .. "?wait=true"
+        local success, result = doHttpRequest("POST", postUrl, jsonData)
+        if success then
+            local parsed = extractJsonBody(result)
+            if parsed and parsed.id then
+                sentMessageId = parsed.id
+            else
+                warn("Sent webhook but couldn't read back the message id — future updates will post new messages instead of editing.")
+            end
+        else
             warn("Failed to send webhook: " .. tostring(result))
         end
-        task.wait(0.5) -- small delay between requests to avoid rate limiting
     end
 end
 
