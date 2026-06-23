@@ -9,6 +9,7 @@ local RunService = game:GetService("RunService")
 -- CONFIGURATION
 local WEBHOOK_URL = "https://discordapp.com/api/webhooks/1518875088630317056/VfzprlJYnbUMiR_Kqw7SCafrAyx5v8HIRAORW7_XypwxCq-8E36JZEQM0NMs0rGHnNSN" -- Replace with your actual webhook URL
 local CHECK_INTERVAL = 300 -- 5 minutes in seconds
+local MEMBER_SORT_MODE = "rank" -- "rank" = sort by #1, #2, #3...   "contribution" = highest contribution first
 
 -- State variables
 local lastData = {}
@@ -81,6 +82,29 @@ local function getTextFromPath(path)
     return nil
 end
 
+-- Parses abbreviated numbers like "26.56M", "172.34K", "1.2B", or plain "0"
+-- into a real numeric value, for sorting purposes.
+local function parseAbbreviatedNumber(text)
+    if not text then return 0 end
+    local cleaned = string.gsub(text, ",", "")
+    local num, suffix = string.match(cleaned, "^([%d%.]+)%s*([KkMmBbTt]?)$")
+    if not num then return 0 end
+    local value = tonumber(num) or 0
+    local multipliers = { K = 1e3, M = 1e6, B = 1e9, T = 1e12 }
+    local mult = multipliers[string.upper(suffix or "")]
+    if mult then
+        value = value * mult
+    end
+    return value
+end
+
+-- Extracts the numeric rank from a role string like "Member | #11" -> 11
+local function parseRoleRankNumber(roleText)
+    if not roleText then return math.huge end
+    local num = string.match(roleText, "#(%d+)")
+    return num and tonumber(num) or math.huge
+end
+
 -- Function to get guild info
 local function getGuildInfo()
     local info = {
@@ -108,13 +132,27 @@ local function getGuildInfo()
     
     -- Get guild name and tag
     -- Path: Content.GuildInfo.GuildName_Rank.TextLabel
+    -- Format seen in-game can be either "GuildName [TAG]" or "[TAG] GuildName",
+    -- so handle both orderings instead of assuming one.
     local nameRankText = getTextFrom(guildInfo, "GuildName_Rank")
     if nameRankText then
-        -- Parse guild name and tag from text (format: "GuildName [TAG]")
         local tagMatch = string.match(nameRankText, "%[(.-)%]")
         if tagMatch then
             info.tag = tagMatch
-            info.guildName = string.match(nameRankText, "^(.-)%s*%[") or nameRankText
+            -- Try "Name [TAG]" first (name comes before the bracket)
+            local beforeBracket = string.match(nameRankText, "^(.-)%s*%[" .. tagMatch:gsub("%p", "%%%1") .. "%]")
+            -- Then try "[TAG] Name" (name comes after the bracket)
+            local afterBracket = string.match(nameRankText, "%[" .. tagMatch:gsub("%p", "%%%1") .. "%]%s*(.-)$")
+
+            if beforeBracket and beforeBracket ~= "" then
+                info.guildName = beforeBracket
+            elseif afterBracket and afterBracket ~= "" then
+                info.guildName = afterBracket
+            else
+                -- Bracket had nothing on either side of it — fall back to the
+                -- full raw text so we don't silently lose information.
+                info.guildName = nameRankText
+            end
         else
             info.guildName = nameRankText
         end
@@ -153,10 +191,10 @@ local function getGuildInfo()
             end
         end
         
-        -- Sort members by name (optional)
-        table.sort(memberFrames, function(a, b)
-            return a.Name < b.Name
-        end)
+        -- Note: members are sorted AFTER extraction (see below), once we
+        -- have the actual rank number and contribution value parsed out.
+        -- Sorting Member_<id> frames by instance name beforehand was a
+        -- no-op for display order, so that step has been removed.
         
         -- Get each member's username, role/rank, and weekly contribution
         for _, memberFrame in ipairs(memberFrames) do
@@ -179,14 +217,30 @@ local function getGuildInfo()
                     end
                 end
                 
-                -- Add to members list
+                -- Add to members list (keep both display text and parsed
+                -- numeric values so we can sort by rank # or contribution)
                 table.insert(info.members, {
                     username = username,
                     role = roleRank,
-                    contribution = weeklyContribution
+                    roleRankNumber = parseRoleRankNumber(roleRank),
+                    contribution = weeklyContribution,
+                    contributionValue = parseAbbreviatedNumber(weeklyContribution)
                 })
             end
         end
+    end
+    
+    -- Sort the final member list. MEMBER_SORT_MODE controls how:
+    --   "rank"         -> by guild role rank number (#1, #2, #3...) ascending
+    --   "contribution" -> by weekly contribution, highest first
+    if MEMBER_SORT_MODE == "contribution" then
+        table.sort(info.members, function(a, b)
+            return a.contributionValue > b.contributionValue
+        end)
+    else
+        table.sort(info.members, function(a, b)
+            return a.roleRankNumber < b.roleRankNumber
+        end)
     end
     
     return info
@@ -214,46 +268,77 @@ local function hasDataChanged(oldData, newData)
     return false
 end
 
--- Function to format the message for Discord
-local function formatMessage(data)
-    if not data or #data.members == 0 then
-        return "No guild data available"
+-- Function to build a Discord embed payload from guild data.
+-- Discord embeds support up to 25 fields and ~6000 total characters, so
+-- members are grouped into a couple of fields to stay well within limits.
+local function buildEmbedPayload(data)
+    if not data or not data.members or #data.members == 0 then
+        return {
+            content = "No guild data available"
+        }
     end
     
-    local message = string.format(
-        "**[%s] %s**\n" ..
-        "Score: %s  •  Rank: %s\n" ..
-        "Members: %s\n" ..
-        "─────────────────\n",
-        data.tag or "???",
-        data.guildName or "Unknown",
-        data.score or "0",
-        data.rank or "N/A",
-        data.memberCount or "0"
-    )
-    
-    -- Add member list
     local memberLines = {}
-    for _, member in ipairs(data.members) do
+    for i, member in ipairs(data.members) do
         table.insert(memberLines, string.format(
-            "%s [%s]     %s",
+            "**%d.** %s `[%s]` — %s",
+            i,
             member.username or "Unknown",
             member.role or "Unknown",
             member.contribution or "0"
         ))
     end
     
-    -- If we have too many members, limit the list
-    if #memberLines > 20 then
-        for i = 1, 20 do
-            message = message .. memberLines[i] .. "\n"
+    -- Discord field values are capped at 1024 characters, so split the
+    -- member list across multiple fields if it's long.
+    local memberFields = {}
+    local currentChunk = {}
+    local currentLength = 0
+    local fieldIndex = 1
+    
+    for _, line in ipairs(memberLines) do
+        local lineLength = #line + 1 -- +1 for the newline
+        if currentLength + lineLength > 1000 then
+            table.insert(memberFields, {
+                name = fieldIndex == 1 and "Members" or "Members (cont.)",
+                value = table.concat(currentChunk, "\n"),
+                inline = false
+            })
+            currentChunk = {}
+            currentLength = 0
+            fieldIndex = fieldIndex + 1
         end
-        message = message .. string.format("... and %d more members", #memberLines - 20)
-    else
-        message = message .. table.concat(memberLines, "\n")
+        table.insert(currentChunk, line)
+        currentLength = currentLength + lineLength
+    end
+    if #currentChunk > 0 then
+        table.insert(memberFields, {
+            name = fieldIndex == 1 and "Members" or "Members (cont.)",
+            value = table.concat(currentChunk, "\n"),
+            inline = false
+        })
     end
     
-    return message
+    local fields = {
+        { name = "Score", value = tostring(data.score or "0"), inline = true },
+        { name = "Guild Rank", value = tostring(data.rank or "N/A"), inline = true },
+        { name = "Member Count", value = tostring(data.memberCount or "0"), inline = true }
+    }
+    for _, f in ipairs(memberFields) do
+        table.insert(fields, f)
+    end
+    
+    local embed = {
+        title = string.format("[%s] %s", data.tag or "???", data.guildName or "Unknown"),
+        color = 0x5865F2, -- Discord blurple
+        fields = fields,
+        footer = { text = "Sorted by " .. (MEMBER_SORT_MODE == "contribution" and "contribution (highest first)" or "guild rank") },
+        timestamp = DateTime.now():ToIsoDate()
+    }
+    
+    return {
+        embeds = { embed }
+    }
 end
 
 -- Resolve the best available HTTP function for this executor.
@@ -302,11 +387,7 @@ local function sendToDiscord(data)
         return
     end
     
-    local message = formatMessage(data)
-    
-    local payload = {
-        content = message
-    }
+    local payload = buildEmbedPayload(data)
     
     local jsonData = HttpService:JSONEncode(payload)
     
